@@ -31,6 +31,8 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
 
+	"github.com/pires/go-proxyproto"
+	"golang.org/x/net/http2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -417,20 +419,51 @@ func (m *Prober) processWorkItem() bool {
 	item.logger.Infof("Processing probe for %s, IP: %s:%s (depth: %d)",
 		item.url, item.podIP, item.podPort, m.workQueue.Len())
 
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.TLSClientConfig = &tls.Config{
-		//nolint:gosec
-		// We only want to know that the Gateway is configured, not that the configuration is valid.
-		// Therefore, we can safely ignore any TLS certificate validation.
-		InsecureSkipVerify: true,
+	targetTCP, err := net.ResolveTCPAddr("tcp", item.podIP+":"+item.podPort)
+	if err != nil {
+		item.logger.Fatalf("Failed to resolve TCP address: %v", err)
+		return false
 	}
-	transport.DialContext = func(ctx context.Context, network, _ string) (conn net.Conn, e error) {
-		// Requests with the IP as hostname and the Host header set do no pass client-side validation
-		// because the HTTP client validates that the hostname (not the Host header) matches the server
-		// TLS certificate Common Name or Alternative Names. Therefore, http.Request.URL is set to the
-		// hostname and it is substituted it here with the target IP.
-		return dialContext(ctx, network, net.JoinHostPort(item.podIP, item.podPort))
+	conn, err := net.DialTCP("tcp", nil, targetTCP)
+	if err != nil {
+		item.logger.Fatalf("Failed to dial Pod address: %v", err)
+		return false
 	}
+	defer conn.Close()
+
+	proxyHeader := proxyproto.Header{
+		Version:           1,
+		Command:           proxyproto.PROXY,
+		TransportProtocol: proxyproto.TCPv4,
+		SourceAddr: &net.TCPAddr{
+			IP:   net.ParseIP("10.1.1.1"),
+			Port: 1000,
+		},
+		DestinationAddr: &net.TCPAddr{
+			IP:   targetTCP.IP,
+			Port: targetTCP.Port,
+		},
+	}
+	if _, err := proxyHeader.WriteTo(conn); err != nil {
+		item.logger.Fatalf("Failed to write to connection to Pod: %v", err)
+		return false
+	}
+	t := http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, _ string, _ *tls.Config) (conn net.Conn, e error) {
+			// Requests with the IP as hostname and the Host header set do no pass client-side validation
+			// because the HTTP client validates that the hostname (not the Host header) matches the server
+			// TLS certificate Common Name or Alternative Names. Therefore, http.Request.URL is set to the
+			// hostname and it is substituted it here with the target IP.
+			return dialContext(ctx, network, net.JoinHostPort(item.podIP, item.podPort))
+		},
+	}
+	transport, err := t.NewClientConn(conn)
+	if err != nil {
+		item.logger.Fatalf("Failed to create new client connection to Pod: %v", err)
+		return false
+	}
+	defer transport.Close()
 
 	probeURL := deepCopy(item.url)
 
@@ -440,7 +473,7 @@ func (m *Prober) processWorkItem() bool {
 
 	ctx, cancel := context.WithTimeout(item.context, probeTimeout)
 	defer cancel()
-	ok, err := prober.Do(
+	ok, err = prober.Do(
 		ctx,
 		transport,
 		probeURL.String(),
